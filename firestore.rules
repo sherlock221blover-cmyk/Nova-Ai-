@@ -1,0 +1,302 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: deny all reads and writes by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Security Primitives ---
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAuthorizedOwner() {
+      return isVerifiedUser() && (
+        request.auth.uid == '8LAO4J4Td5USv4w0d6ORrksFg6G3'
+        || (
+          'email' in request.auth.token
+          && request.auth.token.email.lower() in [
+            'raorashidiqbal1120@gmail.com',
+            'muhibalipangay1120@gmail.com',
+            'muhibalipangay1120@gmail.con'
+          ]
+        )
+      );
+    }
+
+    function isOwner(userId) {
+      return isAuthorizedOwner() && request.auth.uid == userId;
+    }
+
+    function parentUserExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId));
+    }
+
+    // --- Entity Validation Blueprints ---
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+        'uid',
+        'preferredName',
+        'preferredLanguage',
+        'voiceName',
+        'voiceStyle',
+        'autoSpeak',
+        'webSearchDefault',
+        'autoMemoryExtract',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'uid',
+        'preferredName',
+        'preferredLanguage',
+        'voiceName',
+        'voiceStyle',
+        'autoSpeak',
+        'webSearchDefault',
+        'autoMemoryExtract',
+        'playfulJealousy',
+        'currentMood',
+        'currentMoodNote',
+        'currentMoodUpdatedAt',
+        'createdAt',
+        'updatedAt'
+      ])
+      && data.uid is string
+      && data.uid.size() >= 1
+      && data.uid.size() <= 128
+      && data.uid == userId
+      && data.uid == request.auth.uid
+      && data.preferredName is string
+      && data.preferredName.size() <= 64
+      && data.preferredLanguage is string
+      && data.preferredLanguage.size() >= 2
+      && data.preferredLanguage.size() <= 32
+      && data.voiceName in ['Kore', 'Zephyr']
+      && data.voiceStyle in ['warm', 'calm', 'playful']
+      && data.autoSpeak is bool
+      && data.webSearchDefault is bool
+      && data.autoMemoryExtract is bool
+      && (!('playfulJealousy' in data) || data.playfulJealousy is bool)
+      && (!('currentMood' in data) || data.currentMood in ['happy', 'calm', 'excited', 'tired', 'stressed', 'anxious', 'sad', 'overwhelmed'])
+      && (!('currentMoodNote' in data) || (data.currentMoodNote is string && data.currentMoodNote.size() <= 240))
+      && (!('currentMoodUpdatedAt' in data) || data.currentMoodUpdatedAt is timestamp)
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidMemoryItem(data, userId, memoryId) {
+      return data.keys().hasAll(['id', 'uid', 'category', 'content', 'source', 'createdAt', 'updatedAt'])
+      && data.keys().hasOnly(['id', 'uid', 'category', 'content', 'source', 'createdAt', 'updatedAt'])
+      && data.id is string
+      && data.id == memoryId
+      && isValidId(data.id)
+      && data.uid is string
+      && data.uid == userId
+      && data.uid == request.auth.uid
+      && data.category in ['preference', 'identity', 'interest', 'goal', 'language', 'note']
+      && data.content is string
+      && data.content.size() >= 1
+      && data.content.size() <= 500
+      && data.source in ['manual', 'assistant']
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidChatMessage(data, userId, messageId) {
+      return data.keys().hasAll(['id', 'uid', 'role', 'text', 'usedSearch', 'sourceUrls', 'sourceTitles', 'createdAt'])
+      && data.keys().hasOnly(['id', 'uid', 'role', 'text', 'usedSearch', 'sourceUrls', 'sourceTitles', 'createdAt'])
+      && data.id is string
+      && data.id == messageId
+      && isValidId(data.id)
+      && data.uid is string
+      && data.uid == userId
+      && data.uid == request.auth.uid
+      && data.role in ['user', 'assistant']
+      && data.text is string
+      && data.text.size() >= 1
+      && data.text.size() <= 8000
+      && data.usedSearch is bool
+      && data.sourceUrls is list
+      && data.sourceUrls.size() <= 10
+      && (data.sourceUrls.size() == 0 || (data.sourceUrls[0] is string && data.sourceUrls[0].size() <= 1024))
+      && data.sourceTitles is list
+      && data.sourceTitles.size() <= 10
+      && (data.sourceTitles.size() == 0 || (data.sourceTitles[0] is string && data.sourceTitles[0].size() <= 240))
+      && data.createdAt is timestamp;
+    }
+
+    function isValidAutomationRoutine(data, userId, automationId) {
+      return data.keys().hasAll(['id', 'uid', 'title', 'description', 'actionType', 'scheduleTime', 'enabled', 'createdAt', 'updatedAt'])
+      && data.keys().hasOnly(['id', 'uid', 'title', 'description', 'actionType', 'scheduleTime', 'enabled', 'createdAt', 'updatedAt'])
+      && data.id is string
+      && data.id == automationId
+      && isValidId(data.id)
+      && data.uid is string
+      && data.uid == userId
+      && data.uid == request.auth.uid
+      && data.title is string
+      && data.title.size() >= 1
+      && data.title.size() <= 120
+      && data.description is string
+      && data.description.size() >= 1
+      && data.description.size() <= 400
+      && data.actionType in ['briefing', 'study_plan', 'task_sync', 'chat_digest']
+      && data.scheduleTime is string
+      && data.scheduleTime.size() >= 4
+      && data.scheduleTime.size() <= 16
+      && data.enabled is bool
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidMoodLog(data, userId, moodId) {
+      return data.keys().hasAll(['id', 'uid', 'mood', 'note', 'createdAt'])
+      && data.keys().hasOnly(['id', 'uid', 'mood', 'note', 'createdAt'])
+      && data.id is string
+      && data.id == moodId
+      && isValidId(data.id)
+      && data.uid is string
+      && data.uid == userId
+      && data.uid == request.auth.uid
+      && data.mood in ['happy', 'calm', 'excited', 'tired', 'stressed', 'anxious', 'sad', 'overwhelmed']
+      && data.note is string
+      && data.note.size() <= 240
+      && data.createdAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (!('currentMoodUpdatedAt' in incoming()) || incoming().currentMoodUpdatedAt == request.time || (('currentMoodUpdatedAt' in existing()) && incoming().currentMoodUpdatedAt == existing().currentMoodUpdatedAt))
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'preferredName',
+          'preferredLanguage',
+          'voiceName',
+          'voiceStyle',
+          'autoSpeak',
+          'webSearchDefault',
+          'autoMemoryExtract',
+          'playfulJealousy',
+          'currentMood',
+          'currentMoodNote',
+          'currentMoodUpdatedAt',
+          'updatedAt'
+        ]);
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      match /memories/{memoryId} {
+        allow get: if isValidId(userId) && isValidId(memoryId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.uid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(memoryId)
+          && isOwner(userId)
+          && isValidMemoryItem(incoming(), userId, memoryId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && parentUserExists(userId);
+        allow update: if isValidId(userId)
+          && isValidId(memoryId)
+          && isOwner(userId)
+          && isValidMemoryItem(incoming(), userId, memoryId)
+          && incoming().id == existing().id
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && parentUserExists(userId)
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'category',
+            'content',
+            'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && isValidId(memoryId) && isOwner(userId);
+      }
+
+      match /messages/{messageId} {
+        allow get: if isValidId(userId) && isValidId(messageId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.uid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(messageId)
+          && isOwner(userId)
+          && isValidChatMessage(incoming(), userId, messageId)
+          && incoming().createdAt == request.time
+          && parentUserExists(userId);
+        allow update: if false;
+        allow delete: if isValidId(userId) && isValidId(messageId) && isOwner(userId);
+      }
+
+      match /automations/{automationId} {
+        allow get: if isValidId(userId) && isValidId(automationId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.uid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(automationId)
+          && isOwner(userId)
+          && isValidAutomationRoutine(incoming(), userId, automationId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && parentUserExists(userId);
+        allow update: if isValidId(userId)
+          && isValidId(automationId)
+          && isOwner(userId)
+          && isValidAutomationRoutine(incoming(), userId, automationId)
+          && incoming().id == existing().id
+          && incoming().uid == existing().uid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && parentUserExists(userId)
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'actionType', 'scheduleTime', 'enabled', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(automationId) && isOwner(userId);
+      }
+
+      match /moods/{moodId} {
+        allow get: if isValidId(userId) && isValidId(moodId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.uid == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(moodId)
+          && isOwner(userId)
+          && isValidMoodLog(incoming(), userId, moodId)
+          && incoming().createdAt == request.time
+          && parentUserExists(userId);
+        allow update: if false;
+        allow delete: if isValidId(userId) && isValidId(moodId) && isOwner(userId);
+      }
+    }
+  }
+}

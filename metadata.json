@@ -1,0 +1,6 @@
+{
+  "name": "NOVA AI",
+  "description": "Your warm, intelligent, voice-enabled personal AI companion with persistent memory, live voice conversation, web search, and Google Workspace integration.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
