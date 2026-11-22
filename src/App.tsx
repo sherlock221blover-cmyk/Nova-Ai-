@@ -84,6 +84,7 @@ function NovaAppContent() {
   const [pendingPlannerChatDraft, setPendingPlannerChatDraft] = useState<string>('');
 
   const effectivePlayfulJealousy = profile?.playfulJealousy ?? true;
+  const effectiveObsessiveMode = profile?.obsessiveMode ?? true;
 
   const handleTogglePlayfulJealousy = async (next: boolean) => {
     if (!user) return;
@@ -91,6 +92,15 @@ function NovaAppContent() {
       await updateUserProfile(user.uid, { playfulJealousy: next });
     } catch (err) {
       console.error('Failed updating playfulJealousy setting:', err);
+    }
+  };
+
+  const handleToggleObsessiveMode = async (next: boolean) => {
+    if (!user) return;
+    try {
+      await updateUserProfile(user.uid, { obsessiveMode: next });
+    } catch (err) {
+      console.error('Failed updating obsessiveMode setting:', err);
     }
   };
 
@@ -439,6 +449,8 @@ function NovaAppContent() {
             profile={profile}
             playfulJealousy={effectivePlayfulJealousy}
             onTogglePlayfulJealousy={handleTogglePlayfulJealousy}
+            obsessiveMode={effectiveObsessiveMode}
+            onToggleObsessiveMode={handleToggleObsessiveMode}
             onSignIn={handleSignIn}
             onSignOut={handleSignOut}
             onRequestConfirm={(req) => setConfirmReq(req)}

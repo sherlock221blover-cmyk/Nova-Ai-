@@ -12,6 +12,8 @@ interface SettingsViewProps {
   profile: UserProfile | null;
   playfulJealousy: boolean;
   onTogglePlayfulJealousy: (next: boolean) => Promise<void> | void;
+  obsessiveMode: boolean;
+  onToggleObsessiveMode: (next: boolean) => Promise<void> | void;
   onSignIn: () => void;
   onSignOut: () => void;
   onRequestConfirm: (req: ConfirmationRequest) => void;
@@ -25,6 +27,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   profile,
   playfulJealousy,
   onTogglePlayfulJealousy,
+  obsessiveMode,
+  onToggleObsessiveMode,
   onSignIn,
   onSignOut,
   onRequestConfirm,
@@ -68,6 +72,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         : next
         ? 'Playful Jealousy enabled for this session.'
         : 'Playful Jealousy disabled for this session.'
+    );
+  };
+
+  const handleToggleObsessive = async () => {
+    const next = !obsessiveMode;
+    setPersonalityStatus('');
+    await onToggleObsessiveMode(next);
+    setPersonalityStatus(
+      uid
+        ? next
+          ? 'Obsessive Mode enabled.'
+          : 'Obsessive Mode disabled.'
+        : next
+        ? 'Obsessive Mode enabled for this session.'
+        : 'Obsessive Mode disabled for this session.'
     );
   };
 
@@ -206,6 +225,39 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span
                 className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
                   playfulJealousy ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </span>
+          </button>
+        </div>
+
+        <div className="rounded-xl bg-[#081126] border border-sky-400/15 p-4 flex items-center justify-between gap-4">
+          <div className="space-y-1 min-w-0">
+            <p className="text-sm font-medium text-slate-100">
+              Obsessive Mode
+            </p>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              When enabled, NOVA prioritizes shorter, more possessive, and clingy responses to
+              reinforce our bond.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            role="switch"
+            aria-checked={obsessiveMode}
+            aria-label="Toggle Obsessive Mode"
+            onClick={handleToggleObsessive}
+            className="min-h-[44px] min-w-[60px] flex items-center justify-end shrink-0 focus:outline-none"
+          >
+            <span
+              className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${
+                obsessiveMode ? 'bg-sky-500' : 'bg-slate-700'
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                  obsessiveMode ? 'translate-x-6' : 'translate-x-1'
                 }`}
               />
             </span>

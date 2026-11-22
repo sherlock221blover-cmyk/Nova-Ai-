@@ -22,6 +22,7 @@ export interface UserProfile {
   webSearchDefault: boolean;
   autoMemoryExtract: boolean;
   playfulJealousy?: boolean;
+  obsessiveMode?: boolean;
   currentMood?: MoodType;
   currentMoodNote?: string;
   currentMoodUpdatedAt?: unknown;

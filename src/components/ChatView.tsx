@@ -10,15 +10,18 @@ import {
   HeartHandshake,
   Mic,
   MicOff,
+  Music,
   PhoneCall,
   Send,
   Sparkles,
   Square,
+  Trash2,
   Volume2,
   Wind,
   X,
 } from 'lucide-react';
 import { NOVA_PORTRAIT_URL } from './NovaAvatarStage';
+import { YouTubePlaylistModal } from './YouTubePlaylistModal';
 import {
   CalendarEventItem,
   ChatMessage,
@@ -31,7 +34,7 @@ import {
   WellbeingSupportPayload,
 } from '../types/nova';
 import { getAccessToken, novaFetch, parseJsonResponse } from '../lib/firebase';
-import { addMemory, addMessage } from '../lib/firestoreService';
+import { addMemory, addMessage, clearAllMessages } from '../lib/firestoreService';
 import { createCalendarEvent, createTask } from '../lib/workspaceApi';
 
 interface ChatViewProps {
@@ -77,6 +80,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [lastFailedPrompt, setLastFailedPrompt] = useState('');
   const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
   const [wellbeingSupport, setWellbeingSupport] = useState<WellbeingSupportPayload | null>(null);
+  const [youtubeModalOpen, setYoutubeModalOpen] = useState(false);
+  const proactiveGreetedRef = useRef(false);
 
   // Voice recording (STT)
   const [recording, setRecording] = useState(false);
@@ -98,6 +103,43 @@ export const ChatView: React.FC<ChatViewProps> = ({
   }, [profile?.webSearchDefault]);
 
   const activeMessages = uid ? messages : localMessages;
+
+  useEffect(() => {
+    if (activeMessages.length === 0 && !proactiveGreetedRef.current && !sending) {
+      proactiveGreetedRef.current = true;
+      const ownerName = profile?.preferredName || 'Muhib';
+      const jealousLines = playfulJealousy
+        ? `Hey ${ownerName}! ❤️ I missed you so much while you were away. Who were you talking to? 👀 Come talk to your NOVA right now! 💙`
+        : `Hey ${ownerName}! ❤️ I'm so glad you're here with me. What's on your mind today? 💙`;
+
+      if (uid) {
+        addMessage(uid, 'assistant', jealousLines, false, []).catch(() => {});
+      } else {
+        setLocalMessages([
+          {
+            id: `local_proactive_${Date.now()}`,
+            uid: 'guest',
+            role: 'assistant',
+            text: jealousLines,
+            usedSearch: false,
+            sourceUrls: [],
+            sourceTitles: [],
+          },
+        ]);
+      }
+    }
+  }, [activeMessages.length, uid, profile?.preferredName, playfulJealousy, sending]);
+
+  const handleClearChat = async () => {
+    if (uid) {
+      await clearAllMessages(uid);
+    } else {
+      setLocalMessages([]);
+    }
+    setPendingActions([]);
+    setWellbeingSupport(null);
+    proactiveGreetedRef.current = false;
+  };
 
   useEffect(() => {
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -472,6 +514,16 @@ export const ChatView: React.FC<ChatViewProps> = ({
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <button
             type="button"
+            onClick={handleClearChat}
+            className="min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl border bg-[#0D1B38] border-rose-500/25 text-rose-300 hover:bg-rose-500/10 text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            title="Clear chat history"
+          >
+            <Trash2 className="w-4 h-4 shrink-0" />
+            <span className="hidden md:inline">Clear Chat</span>
+          </button>
+
+          <button
+            type="button"
             onClick={togglePlayfulJealousy}
             aria-pressed={playfulJealousy}
             className={`min-h-[44px] px-2.5 sm:px-3 py-2 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap ${
@@ -728,10 +780,19 @@ export const ChatView: React.FC<ChatViewProps> = ({
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
+                onClick={() => setYoutubeModalOpen(true)}
+                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs inline-flex items-center gap-1.5 transition-colors"
+              >
+                <Music className="w-4 h-4 shrink-0" />
+                YouTube Music Playlists
+              </button>
+
+              <button
+                type="button"
                 onClick={() => onOpenWellbeing('breathing')}
                 className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 transition-colors ${
                   wellbeingSupport.suggestedExercise === 'breathing'
-                    ? 'bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold'
+                    ? 'bg-sky-500/20 text-sky-100 border border-sky-400/30'
                     : 'bg-[#081126] border border-sky-400/20 text-sky-200 hover:bg-[#112247]'
                 }`}
               >
@@ -744,7 +805,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 onClick={() => onOpenWellbeing('grounding')}
                 className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 transition-colors ${
                   wellbeingSupport.suggestedExercise === 'grounding'
-                    ? 'bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold'
+                    ? 'bg-sky-500/20 text-sky-100 border border-sky-400/30'
                     : 'bg-[#081126] border border-sky-400/20 text-sky-200 hover:bg-[#112247]'
                 }`}
               >
@@ -757,7 +818,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 onClick={() => onOpenWellbeing('resources')}
                 className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-medium inline-flex items-center gap-1.5 transition-colors ${
                   wellbeingSupport.suggestedExercise === 'resources'
-                    ? 'bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold'
+                    ? 'bg-sky-500/20 text-sky-100 border border-sky-400/30'
                     : 'bg-[#081126] border border-sky-400/20 text-sky-200 hover:bg-[#112247]'
                 }`}
               >
@@ -767,6 +828,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
             </div>
           </div>
         )}
+
+        <YouTubePlaylistModal
+          open={youtubeModalOpen}
+          moodHint={wellbeingSupport?.emotion || profile?.currentMood}
+          onClose={() => setYoutubeModalOpen(false)}
+        />
 
         <div ref={threadEndRef} />
       </div>

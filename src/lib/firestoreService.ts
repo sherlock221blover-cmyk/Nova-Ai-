@@ -64,6 +64,7 @@ export async function ensureUserProfile(
     webSearchDefault: false,
     autoMemoryExtract: true,
     playfulJealousy: true,
+    obsessiveMode: true,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -105,6 +106,7 @@ export async function updateUserProfile(
       | 'webSearchDefault'
       | 'autoMemoryExtract'
       | 'playfulJealousy'
+      | 'obsessiveMode'
     >
   >
 ): Promise<void> {
@@ -135,6 +137,8 @@ export async function updateUserProfile(
       sanitized.autoMemoryExtract = Boolean(patch.autoMemoryExtract);
     if (patch.playfulJealousy !== undefined)
       sanitized.playfulJealousy = Boolean(patch.playfulJealousy);
+    if (patch.obsessiveMode !== undefined)
+      sanitized.obsessiveMode = Boolean(patch.obsessiveMode);
 
     await updateDoc(doc(db, 'users', uid), sanitized);
   } catch (error) {
