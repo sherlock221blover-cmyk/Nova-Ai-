@@ -288,7 +288,10 @@ function NovaAppContent() {
   }
 
   return (
-    <div className="min-h-screen bg-[#060D1E] text-slate-100 flex flex-col">
+    <div
+      className="min-h-screen text-slate-100 flex flex-col transition-all duration-700"
+      style={{ background: 'var(--nova-bg-gradient, #060D1E)' }}
+    >
       {/* Desktop Top Navigation Bar (Strict 3-Zone Contract) */}
       <header className="hidden lg:flex sticky top-0 z-30 h-16 px-8 items-center justify-between gap-8 bg-[#060D1E]/90 backdrop-blur-md border-b border-sky-400/15">
         <button

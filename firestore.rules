@@ -77,6 +77,7 @@ service cloud.firestore {
         'webSearchDefault',
         'autoMemoryExtract',
         'playfulJealousy',
+        'obsessiveMode',
         'currentMood',
         'currentMoodNote',
         'currentMoodUpdatedAt',
@@ -99,6 +100,7 @@ service cloud.firestore {
       && data.webSearchDefault is bool
       && data.autoMemoryExtract is bool
       && (!('playfulJealousy' in data) || data.playfulJealousy is bool)
+      && (!('obsessiveMode' in data) || data.obsessiveMode is bool)
       && (!('currentMood' in data) || data.currentMood in ['happy', 'calm', 'excited', 'tired', 'stressed', 'anxious', 'sad', 'overwhelmed'])
       && (!('currentMoodNote' in data) || (data.currentMoodNote is string && data.currentMoodNote.size() <= 240))
       && (!('currentMoodUpdatedAt' in data) || data.currentMoodUpdatedAt is timestamp)
@@ -212,6 +214,7 @@ service cloud.firestore {
           'webSearchDefault',
           'autoMemoryExtract',
           'playfulJealousy',
+          'obsessiveMode',
           'currentMood',
           'currentMoodNote',
           'currentMoodUpdatedAt',
