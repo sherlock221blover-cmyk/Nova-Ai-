@@ -70,6 +70,20 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const openTasks = tasks.filter((t) => t.status === 'needsAction');
   const currentMoodMeta = MOOD_OPTIONS.find((m) => m.id === profile?.currentMood);
 
+  const getGreetingText = () => {
+    const mood = profile?.currentMood;
+    if (mood === 'sad' || mood === 'anxious' || mood === 'stressed' || mood === 'overwhelmed') {
+      return `I'm holding you close today, ${displayName} ❤️ Take a gentle breath—I'm right here with you.`;
+    }
+    if (mood === 'tired') {
+      return `Let's keep things extra cozy and calm today, ${displayName} ☕ Take all the rest you need.`;
+    }
+    if (mood === 'excited' || mood === 'happy') {
+      return `Your radiant energy is making my day, ${displayName}! ✨ What wonderful adventure are we diving into?`;
+    }
+    return `Heyyy, ${displayName}! I&apos;m so happy you&apos;re here. What shall we do together today?`;
+  };
+
   const quickStarters = [
     'Hey NOVA, how are you today?',
     'Help me organize my schedule for today',
@@ -130,14 +144,35 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
         {/* Right Companion Hub */}
         <div className="lg:col-span-7 flex flex-col justify-between gap-6">
-          {/* Welcome Header */}
-          <div className="rounded-3xl bg-[#0D1B38]/90 border border-sky-400/15 p-6 sm:p-7 space-y-5">
+          {/* Welcome Header with Mood-Adaptive Accent Tint */}
+          <div
+            className="rounded-3xl bg-[#0D1B38]/90 p-6 sm:p-7 space-y-5 transition-all duration-500 shadow-lg"
+            style={{
+              borderColor: 'var(--nova-accent-color, rgba(56, 189, 248, 0.25))',
+              borderWidth: '1px',
+              boxShadow: '0 10px 30px -10px var(--nova-glow-color, rgba(56, 189, 248, 0.15))',
+            }}
+          >
             <div className="space-y-2">
-              <p className="text-xs font-medium text-sky-300 tracking-wide">
-                Personal AI Companion · Voice, Search &amp; Memory
-              </p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-medium text-sky-300 tracking-wide">
+                  Personal AI Companion · Voice, Search &amp; Memory
+                </p>
+                {currentMoodMeta && (
+                  <span
+                    className="px-2.5 py-1 rounded-full text-xs font-medium inline-flex items-center gap-1.5"
+                    style={{
+                      background: 'var(--nova-glow-color, rgba(56, 189, 248, 0.15))',
+                      color: 'var(--nova-accent-color, #38bdf8)',
+                    }}
+                  >
+                    <span>{currentMoodMeta.emoji}</span>
+                    <span>{currentMoodMeta.label}</span>
+                  </span>
+                )}
+              </div>
               <h1 className="font-display text-2xl sm:text-3xl font-semibold text-white tracking-tight text-balance">
-                Heyyy, {displayName}! I&apos;m happy you&apos;re here. What shall we do together today?
+                {getGreetingText()}
               </h1>
               <p className="text-sm text-slate-300 leading-relaxed max-w-2xl">
                 Chat with me by text or live voice, ask me to search the web with verified sources,
@@ -156,11 +191,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 <span>How are you feeling?</span>
               </button>
 
-              {currentMoodMeta && (
-                <span className="text-xs text-slate-300">
-                  Current mood: <span aria-hidden="true">{currentMoodMeta.emoji}</span>{' '}
-                  <strong className="font-medium text-white">{currentMoodMeta.label}</strong> ·
-                  NOVA is tailored to your mood
+              {profile?.currentMoodNote && (
+                <span className="text-xs text-slate-300 truncate max-w-xs">
+                  Note: &ldquo;{profile.currentMoodNote}&rdquo;
                 </span>
               )}
             </div>

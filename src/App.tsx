@@ -48,6 +48,7 @@ import { ChatView } from './components/ChatView';
 import { PlannerView } from './components/PlannerView';
 import { MemoryView } from './components/MemoryView';
 import { SettingsView } from './components/SettingsView';
+import { useMoodTheme } from './hooks/useMoodTheme';
 
 type AppTab = 'home' | 'chat' | 'planner' | 'memory' | 'settings';
 
@@ -64,6 +65,8 @@ function NovaAppContent() {
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [automations, setAutomations] = useState<AutomationRoutine[]>([]);
+
+  useMoodTheme(profile?.currentMood);
 
   // Workspace live state
   const [events, setEvents] = useState<CalendarEventItem[]>([]);

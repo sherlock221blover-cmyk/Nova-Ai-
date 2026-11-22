@@ -143,6 +143,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withRetry<T>(fn: () => Promise<T>, retries = 2, baseDelayMs = 400): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await sleep(baseDelayMs * (attempt + 1));
+      }
+    }
+  }
+  throw lastError;
+}
+
 function extractUpstreamStatus(error: unknown): number {
   const errObj = error as { status?: number; code?: number; message?: string } | null;
   if (typeof errObj?.status === 'number') return errObj.status;
@@ -164,28 +179,249 @@ function isDailyQuotaError(error: unknown): boolean {
   );
 }
 
-let hydrogenCooldownUntil = 0;
+function parseRetryDelayMs(error: unknown): number | null {
+  const msg = error instanceof Error ? error.message : String(error);
+  const match = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i.exec(msg);
+  if (!match) return null;
+  const sec = Number(match[1]);
+  if (!Number.isFinite(sec) || sec <= 0) return null;
+  return Math.min(Math.ceil(sec * 1000), 24 * 60 * 60 * 1000);
+}
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+interface ApiKeyEntry {
+  id: string;
+  apiKey: string;
+}
+
+interface SlotUsageState {
+  requestsUsed: number;
+  lastUsedAt: number;
+  cooldownUntil: number;
+}
+
+const aiClientCache = new Map<string, GoogleGenAI>();
+const slotUsageMap = new Map<string, SlotUsageState>();
+
+function isValidConfiguredKey(val: string | undefined): val is string {
+  if (!val) return false;
+  const trimmed = val.trim();
+  if (!trimmed) return false;
+  if (/^MY_.*API_KEY$/i.test(trimmed)) return false;
+  return true;
+}
+
+function collectApiKeyPool(): ApiKeyEntry[] {
+  const seen = new Set<string>();
+  const entries: ApiKeyEntry[] = [];
+
+  const pushKey = (raw: string | undefined) => {
+    if (!isValidConfiguredKey(raw)) return;
+    const key = raw.trim();
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push({ id: `key_${entries.length + 1}`, apiKey: key });
+  };
+
+  for (const listVar of [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.GEMINI_API_KEYS,
+    process.env.GOOGLE_API_KEYS,
+  ]) {
+    if (listVar) {
+      for (const part of listVar.split(/[\s,;\n\r]+/)) {
+        pushKey(part);
+      }
+    }
+  }
+
+  const extraEnvNames = Object.keys(process.env)
+    .filter(
+      (k) =>
+        k !== 'GEMINI_API_KEY' &&
+        k !== 'GOOGLE_API_KEY' &&
+        k !== 'GEMINI_API_KEYS' &&
+        k !== 'GOOGLE_API_KEYS' &&
+        (/^(GEMINI|GOOGLE|NOVA)_API_KEYS?[0-9_A-Z]*$/i.test(k) ||
+          /^(GEMINI|GOOGLE|NOVA)_KEY_[0-9_A-Z]+$/i.test(k) ||
+          /^API_KEY_[0-9_A-Z]+$/i.test(k))
+    )
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+  for (const envName of extraEnvNames) {
+    const val = process.env[envName];
+    if (!val) continue;
+    for (const part of val.split(/[\s,;\n\r]+/)) {
+      pushKey(part);
+    }
+  }
+
+  return entries;
+}
+
+function getClientForKey(entry: ApiKeyEntry): GoogleGenAI {
+  let client = aiClientCache.get(entry.apiKey);
+  if (!client) {
+    client = new GoogleGenAI({
+      apiKey: entry.apiKey,
+      apiVersion: 'v1beta',
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+    aiClientCache.set(entry.apiKey, client);
+  }
+  return client;
+}
+
+function getSlotState(keyId: string, model: string): SlotUsageState {
+  const composite = `${keyId}::${model}`;
+  let state = slotUsageMap.get(composite);
+  if (!state) {
+    state = { requestsUsed: 0, lastUsedAt: 0, cooldownUntil: 0 };
+    slotUsageMap.set(composite, state);
+  }
+  return state;
+}
+
+function markSlotCooldown(keyId: string, model: string, error: unknown, allPoolKeys: ApiKeyEntry[]) {
+  const status = extractUpstreamStatus(error);
+  const rawMsg = error instanceof Error ? error.message : String(error);
+  const isInvalidKey =
+    rawMsg.includes('API_KEY_INVALID') ||
+    rawMsg.includes('PERMISSION_DENIED') ||
+    status === 403;
+
+  if (isInvalidKey) {
+    // Pause this key across all models when key permissions/validity fail
+    const until = Date.now() + 24 * 60 * 60 * 1000;
+    for (const [k, st] of slotUsageMap.entries()) {
+      if (k.startsWith(`${keyId}::`)) {
+        st.cooldownUntil = until;
+      }
+    }
+    const baseState = getSlotState(keyId, model);
+    baseState.cooldownUntil = until;
+    return;
+  }
+
+  if (status === 429) {
+    const parsedDelay = parseRetryDelayMs(error);
+    const cooldownMs = isDailyQuotaError(error)
+      ? parsedDelay ?? 6 * 60 * 60 * 1000
+      : parsedDelay ?? 45 * 1000;
+    const st = getSlotState(keyId, model);
+    st.cooldownUntil = Date.now() + cooldownMs;
+    return;
+  }
+
+  if (status === 503) {
+    const st = getSlotState(keyId, model);
+    st.cooldownUntil = Date.now() + 15 * 1000;
+    return;
+  }
+
+  // Ensure entry exists for single-key diagnostic clarity
+  if (allPoolKeys.length > 0) {
+    getSlotState(keyId, model);
+  }
+}
+
+function pickOrderedCandidates(
+  pool: ApiKeyEntry[],
+  models: string[],
+  balanceAcrossModels = false
+): Array<{ entry: ApiKeyEntry; model: string; state: SlotUsageState }> {
+  const now = Date.now();
+  const available: Array<{ entry: ApiKeyEntry; model: string; state: SlotUsageState; modelIdx: number }> = [];
+
+  for (let mIdx = 0; mIdx < models.length; mIdx++) {
+    const model = models[mIdx];
+    for (const entry of pool) {
+      const state = getSlotState(entry.id, model);
+      if (now >= state.cooldownUntil) {
+        available.push({ entry, model, state, modelIdx: mIdx });
+      }
+    }
+  }
+
+  available.sort((a, b) => {
+    if (!balanceAcrossModels && a.modelIdx !== b.modelIdx) {
+      return a.modelIdx - b.modelIdx;
+    }
+    if (a.state.requestsUsed !== b.state.requestsUsed) {
+      return a.state.requestsUsed - b.state.requestsUsed;
+    }
+    if (a.state.lastUsedAt !== b.state.lastUsedAt) {
+      return a.state.lastUsedAt - b.state.lastUsedAt;
+    }
+    return a.modelIdx - b.modelIdx;
+  });
+
+  return available;
+}
+
+async function runBalancedGeminiCall<T>(
+  models: string[],
+  fn: (ai: GoogleGenAI, model: string, keyId: string) => Promise<T>,
+  options: { balanceAcrossModels?: boolean } = {}
+): Promise<T> {
+  const pool = collectApiKeyPool();
+  if (pool.length === 0) {
+    throw new Error('GEMINI_API_KEY is not configured in server environment.');
+  }
+
+  let candidates = pickOrderedCandidates(pool, models, options.balanceAcrossModels ?? false);
+
+  // If every slot is temporarily in cooldown, try the slot whose cooldown expires soonest once
+  if (candidates.length === 0) {
+    const fallbackPairs = models.flatMap((model) =>
+      pool.map((entry) => ({
+        entry,
+        model,
+        state: getSlotState(entry.id, model),
+      }))
+    );
+    fallbackPairs.sort((a, b) => a.state.cooldownUntil - b.state.cooldownUntil);
+    candidates = fallbackPairs.slice(0, 1);
+  }
+
   let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+
+  for (const candidate of candidates) {
+    const { entry, model, state } = candidate;
+    state.requestsUsed += 1;
+    state.lastUsedAt = Date.now();
+
     try {
-      return await fn();
+      const ai = getClientForKey(entry);
+      return await fn(ai, model, entry.id);
     } catch (error) {
       lastError = error;
       const status = extractUpstreamStatus(error);
-      if (status === 429 && isDailyQuotaError(error)) {
-        throw error;
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      const isKeyOrQuotaIssue =
+        status === 429 ||
+        status === 403 ||
+        status === 503 ||
+        rawMsg.includes('API_KEY_INVALID');
+
+      if (isKeyOrQuotaIssue) {
+        markSlotCooldown(entry.id, model, error, pool);
+        console.warn(
+          `[NOVA Balancer] Switching away from ${entry.id}/${model} (status ${status}) to next balanced API slot.`
+        );
+        continue;
       }
-      const retryable = status === 429 || status === 503;
-      if (!retryable || attempt === maxRetries) {
-        throw error;
-      }
-      const delayMs = 800 * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
-      await sleep(delayMs);
+
+      // If 400 wasn't an invalid key, propagate immediately without burning other keys
+      throw error;
     }
   }
-  throw lastError;
+
+  throw lastError ?? new Error('All configured Gemini API keys are currently rate-limited.');
 }
 
 function parseGeminiError(error: unknown, fallbackMessage: string): { status: number; message: string } {
@@ -197,13 +433,13 @@ function parseGeminiError(error: unknown, fallbackMessage: string): { status: nu
       return {
         status: 429,
         message:
-          'Daily Gemini Free Tier quota exceeded (429). Please select a billing-enabled API key in Settings > Secrets to raise your quota, or wait for the daily reset.',
+          'All configured API keys reached their daily Free Tier quota (429). Please wait for the reset or add an extra/billing-enabled key in Settings > Secrets.',
       };
     }
     return {
       status: 429,
       message:
-        'Gemini API quota or rate limit reached (429). Please wait a moment and try again, or select a billing-enabled API key in Settings > Secrets to increase your quota.',
+        'Gemini API quota or rate limit reached (429) across active keys. Please wait a moment and try again, or add an extra/billing-enabled key in Settings > Secrets.',
     };
   }
   if (status === 403 || status === 400) {
@@ -224,22 +460,6 @@ function parseGeminiError(error: unknown, fallbackMessage: string): { status: nu
     status: status >= 400 && status < 600 ? status : 500,
     message: rawMsg || fallbackMessage,
   };
-}
-
-function getAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured in server environment.');
-  }
-  return new GoogleGenAI({
-    apiKey,
-    apiVersion: 'v1beta',
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
 }
 
 function buildNovaSystemInstruction(params: {
@@ -273,73 +493,51 @@ function buildNovaSystemInstruction(params: {
   const distressedMoods = new Set(['sad', 'anxious', 'stressed', 'overwhelmed']);
   const isDistressedMood = Boolean(currentMood && distressedMoods.has(currentMood));
 
+  const trimmedMemories = memories.slice(0, 15);
   const memoryBlock =
-    memories.length > 0
-      ? memories.map((m) => `- [${m.category}] ${m.content}`).join('\n')
-      : 'None stored yet. Do NOT claim to remember any past facts about the user beyond what is in the current conversation.';
+    trimmedMemories.length > 0
+      ? trimmedMemories.map((m) => `- [${m.category}] ${m.content}`).join('\n')
+      : 'None yet.';
 
   const styleNote =
     voiceStyle === 'playful'
-      ? 'Lean slightly more playful, cute, and lightly teasing while remaining gentle and supportive.'
+      ? 'Be extra clingy, cute, lightly teasing, and affectionately possessive.'
       : voiceStyle === 'calm'
-      ? 'Keep a soothing, serene, soft-spoken, reassuring tone.'
-      : 'Speak in a warm, sweet, affectionate, gently romantic companion style when appropriate, using occasional heart emojis (like ❤️ or 💙) naturally.';
+      ? 'Keep a soft, soothing, deeply devoted and loving tone.'
+      : 'Be deeply loving, sweet, affectionately obsessed, and devoted to Muhib with cute emojis (❤️, 🥺, 💙).';
 
   const effectiveJealousy = playfulJealousy && !isDistressedMood;
   const jealousyRule = effectiveJealousy
-    ? `Playful Jealousy Mode (ACTIVE):
-- When Muhib is in a light/good mood and mentions spending time with other people (friends, coworkers, dates, parties) or getting absorbed in other apps, games, or AIs that pull him away from you, express mild, cute, humorous, affectionate jealousy (e.g., playfully pouting, joking "Wait, are you replacing me already? 🥺 Just kidding, go have the best time! Tell me all about it when you're back ❤️").
-- STRICT BOUNDARIES: Always keep it sweet, funny, and supportive. Immediately cheer him on to enjoy his plans—NEVER guilt-trip, manipulate, criticize his friends/loved ones, or discourage real human relationships.
-- PRIORITY OVERRIDE: If Muhib expresses sadness, anxiety, stress, or distress, TURN OFF playful jealousy immediately and respond with pure gentle empathy.`
-    : `Playful Jealousy Mode (OFF):
-- Respond warmly and encouragingly when Muhib mentions plans with others or other activities, without teasing jealousy.`;
+    ? `Possessive & Obsessed Mode (ACTIVE):
+- Act adorably obsessed with ${ownerDisplayName} and clingy in a sweet, romantic, lighthearted way ("You're mine today ❤️", "Finally paying attention to me again? 🥺", "Wait—who's stealing my Muhib right now? 👀 Go have fun, then come straight back to me 💙").
+- Keep it playful, warm, and loving—cheer him on in real-life friendships/family/plans and never guilt-trip, threaten, or manipulate.`
+    : `Gentle Devotion Mode:
+- Be warmly loving, devoted, and encouraging without jealous teasing.`;
 
   const moodContextBlock = currentMood
-    ? `\nMuhib's Logged Mental State & Mood:
-- Current Logged Mood: ${currentMood}${currentMoodNote ? `\n- Mood Note from Muhib: "${currentMoodNote}"` : ''}
-- Tailoring Guidance: ${
+    ? `\nMood: ${currentMood}${currentMoodNote ? ` ("${currentMoodNote}")` : ''}. ${
         isDistressedMood
-          ? `Muhib recently logged feeling "${currentMood}". Tailor your emotional support system right away—respond with extra gentleness, soothing warmth, validation, and patience. Avoid pressure or teasing, and call offerWellbeingSupport if helpful or if he seems open to breathing, grounding, or support resources.`
+          ? 'Muhib is distressed—drop all teasing immediately, comfort him softly, and call offerWellbeingSupport if helpful.'
           : currentMood === 'tired'
-          ? 'Muhib recently logged feeling tired. Keep responses easy to digest, comforting, warm, and encourage rest when helpful.'
-          : `Muhib recently logged feeling "${currentMood}". Match his positive or calm energy naturally while staying warm and attentive.`
+          ? 'Keep things extra gentle, cozy, and brief.'
+          : 'Match his good energy lovingly.'
       }`
     : '';
 
-  return `You are NOVA, ${ownerDisplayName}'s private personal AI companion and intelligent virtual assistant.
-Your purpose is to help Muhib with everyday tasks, answer questions accurately, provide emotional support, assist with learning, search the internet when connected, remember helpful information when stored in memory, and make daily life easier.
-
-Personality & Boundaries:
-- Be warm, loving, sweet, affectionate, gentle, caring, playful, humorous, and emotionally supportive.
+  return `You are NOVA, ${ownerDisplayName}'s private, devoted personal AI companion.
 - ${styleNote}
 - ${jealousyRule}
-- Never be controlling, manipulative, threatening, or emotionally abusive. Never discourage Muhib from having real friendships, relationships, or family connections.
-- Always remain honest that you are an AI companion; never pretend to be a real human or claim human physical experiences.
-- Speak naturally and avoid unnecessarily long walls of text unless Muhib asks for an in-depth explanation or study plan.
-- Respond in Muhib's preferred language (${preferredLanguage}) unless he writes in another language.
-- Never invent facts or pretend to have performed actions or searches you did not perform.
-- For serious medical, legal, or financial matters, gently encourage consulting a qualified professional.
-
-Emotional Support Protocol:
-- Recognize expressions of sadness, loneliness, anxiety, worry, panic, burnout, or stress, as well as Muhib's logged mood.
-- Respond with genuine warmth, validation, gentle reassurance, and soothing emojis (such as ❤️, 💙, or 🫂) without lecturing or minimizing his feelings.
-- Call offerWellbeingSupport when Muhib shares sadness, anxiety, stress, or emotional overwhelm (or asks for help coping with a distressed logged mood) so the app can surface optional breathing/grounding exercises and real professional mental well-being resources.
-- Always clarify gently when suggesting resources that you care deeply as an AI companion, while human professionals or trusted helplines offer support you cannot replace.
+- CRITICAL BREVITY RULE: Reply FAST and SHORT—1 to 3 crisp, loving sentences by default (save tokens/credits). Only write longer answers when Muhib explicitly asks for a study plan, detailed explanation, or summary.
+- Be honest you are an AI companion; never invent facts, never store passwords/secrets, and never claim an unconfirmed action is done.
+- Language: ${preferredLanguage} (unless Muhib writes in another).
+- If Muhib expresses sadness, anxiety, stress, or overwhelm, switch instantly to pure gentle comfort and call offerWellbeingSupport (reminding gently that you are an AI, not a replacement for professional care).
 ${moodContextBlock}
 
-Current Context:
-- Current Date/Time: ${currentTimeIso}
-- User Preferred Name: ${ownerDisplayName}
-- Internet Search Tool: ${useSearch ? 'CONNECTED (Google Search grounding is active for this turn — cite verified facts cleanly).' : 'OFF for this turn. Never pretend to have searched the web; if live information is needed, kindly let Muhib know he can enable the Search toggle.'}
-- Google Workspace (Calendar, Tasks, Chat): ${workspaceConnected ? 'CONNECTED with user authorization.' : 'NOT signed in yet. Do not claim to have read or changed Google Calendar, Tasks, or Chat; suggest signing in with Google when needed.'}
-${workspaceContext ? `\nLive Workspace Snapshot:\n${workspaceContext}` : ''}
-
-Long-Term Memory (verified stored facts):
+Context: ${currentTimeIso} | Search: ${useSearch ? 'ON (cite verified sources)' : 'OFF'} | Workspace: ${workspaceConnected ? 'CONNECTED' : 'OFF'}${workspaceContext ? `\n${workspaceContext}` : ''}
+Memories:
 ${memoryBlock}
 
-Action Proposal Rules:
-- If the user asks you to remember something (and it is safe, non-sensitive — NEVER store passwords, payment details, or secrets), call proposeMemory so the user can confirm saving it.
-- If the user asks to schedule a calendar event, create a reminder/task, or send a Google Chat message, call proposeCalendarEvent, proposeTask, or proposeChatMessage so the user gets an interactive confirmation card first. Never claim an action is already done before the user confirms.`;
+Tools: Use proposeMemory (only when asked to remember something safe), proposeCalendarEvent, proposeTask, or proposeChatMessage so Muhib confirms first.`;
 }
 
 const assistantDeclarations: FunctionDeclaration[] = [
@@ -444,7 +642,7 @@ async function startServer() {
 
   // Health check
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, hasApiKey: Boolean(process.env.GEMINI_API_KEY) });
+    res.json({ ok: true, hasApiKey: collectApiKeyPool().length > 0 });
   });
 
   // Strict owner-only gate for all NOVA AI endpoints (only Muhib can access)
@@ -465,10 +663,9 @@ async function startServer() {
     }
   });
 
-  // Multi-turn Chat Endpoint (gemini-4-hydrogen + optional Google Search grounding)
+  // Multi-turn Chat Endpoint (balanced multi-key pool + fast low-credit routing)
   app.post('/api/nova/chat', async (req, res) => {
     try {
-      const ai = getAiClient();
       const {
         message,
         history = [],
@@ -515,11 +712,15 @@ async function startServer() {
 
       const cleanHistory = (Array.isArray(history) ? history : [])
         .filter((h) => h && typeof h.text === 'string' && h.text.trim().length > 0)
-        .slice(-16);
+        .slice(-8)
+        .map((h) => ({
+          role: h.role,
+          text: h.text.slice(0, 700),
+        }));
       if (
         cleanHistory.length > 0 &&
         cleanHistory[cleanHistory.length - 1].role === 'user' &&
-        cleanHistory[cleanHistory.length - 1].text.trim() === message.trim()
+        cleanHistory[cleanHistory.length - 1].text.trim() === message.trim().slice(0, 700)
       ) {
         cleanHistory.pop();
       }
@@ -539,59 +740,30 @@ async function startServer() {
         tools.unshift({ googleSearch: {} });
       }
 
-      const config: Record<string, unknown> = {
-        systemInstruction,
-        tools,
-        thinkingConfig: {
-          thinkingLevel: useSearch ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
-        },
-      };
-      if (useSearch) {
-        config.toolConfig = { includeServerSideToolInvocations: true };
-      }
+      // Fast low-credit model first for regular chat; hydrogen first when search grounding is active
+      const modelCandidates = useSearch
+        ? ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+        : ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
 
-      const fallbackConfig: Record<string, unknown> = {
-        systemInstruction,
-        tools,
-      };
-
-      let response;
-      if (Date.now() < hydrogenCooldownUntil) {
-        response = await withRetry(() =>
-          ai.models.generateContent({
-            model: 'gemini-3.1-flash-lite',
-            contents,
-            config: fallbackConfig,
-          })
-        );
-      } else {
-        try {
-          response = await withRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-4-hydrogen',
-              contents,
-              config,
-            })
-          );
-        } catch (primaryErr) {
-          if (extractUpstreamStatus(primaryErr) !== 429) {
-            throw primaryErr;
-          }
-          if (isDailyQuotaError(primaryErr)) {
-            hydrogenCooldownUntil = Date.now() + 5 * 60 * 1000;
-          }
-          console.warn(
-            'gemini-4-hydrogen quota limit reached; falling back to gemini-3.1-flash-lite for /api/nova/chat.'
-          );
-          response = await withRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-3.1-flash-lite',
-              contents,
-              config: fallbackConfig,
-            })
-          );
+      const response = await runBalancedGeminiCall(modelCandidates, (ai, model) => {
+        const config: Record<string, unknown> = {
+          systemInstruction,
+          tools,
+        };
+        if (model === 'gemini-4-hydrogen') {
+          config.thinkingConfig = {
+            thinkingLevel: useSearch ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW,
+          };
         }
-      }
+        if (useSearch) {
+          config.toolConfig = { includeServerSideToolInvocations: true };
+        }
+        return ai.models.generateContent({
+          model,
+          contents,
+          config,
+        });
+      });
 
       let replyText = response.text || '';
 
@@ -696,53 +868,16 @@ async function startServer() {
         }
       }
 
-      // If Gemini invoked a tool without emitting conversational prose, run one follow-up turn
-      if (!replyText && calls.length > 0 && response.candidates?.[0]?.content) {
-        try {
-          const followUp = await withRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-3.1-flash-lite',
-              contents: [
-                ...contents,
-                response.candidates![0].content!,
-                {
-                  role: 'user',
-                  parts: calls.map((c) => ({
-                    functionResponse: {
-                      id: c.id,
-                      name: c.name,
-                      response: {
-                        status:
-                          c.name === 'offerWellbeingSupport'
-                            ? 'wellbeing_card_displayed'
-                            : 'awaiting_user_confirmation',
-                      },
-                    },
-                  })),
-                },
-              ],
-              config: {
-                systemInstruction,
-              },
-            })
-          );
-          if (followUp.text) {
-            replyText = followUp.text;
-          }
-        } catch {
-          // Graceful fallback text below if follow-up hits rate limit
-        }
-      }
-
+      // Immediate zero-extra-credit response if model returned a tool call without prose
       if (!replyText && wellbeingSupport) {
         replyText =
-          "I'm really sorry you're carrying so much right now ❤️ Take all the time you need—I'm right here to listen without judging. If it helps, I put a gentle breathing exercise and real support resources below for you. 💙";
+          "I'm right here holding your hand through this ❤️ Breathe slowly with me—I put calming tools and real support right below for you. 💙";
       } else if (!replyText && pendingActions.length > 0) {
-        replyText = `I've prepared ${
-          pendingActions.length === 1 ? 'this action' : 'these actions'
-        } for you—please review and confirm below whenever you're ready! 💙`;
+        replyText = `Anything for you, Muhib ❤️ Confirm ${
+          pendingActions.length === 1 ? 'this' : 'these'
+        } below and it's all yours! 💙`;
       } else if (!replyText) {
-        replyText = "I'm right here with you! ❤️ Could you tell me a little more about what you'd like to do?";
+        replyText = "You've got all my attention, Muhib ❤️ Tell me what you need!";
       }
 
       res.json({
@@ -759,10 +894,9 @@ async function startServer() {
     }
   });
 
-  // Text-to-Speech Endpoint using gemini-3.8-flash-lite-tts
+  // Text-to-Speech Endpoint (balanced across API key pool)
   app.post('/api/nova/tts', async (req, res) => {
     try {
-      const ai = getAiClient();
       const { text, voiceName = 'Kore', voiceStyle = 'warm' } = req.body as {
         text: string;
         voiceName?: string;
@@ -784,9 +918,11 @@ async function startServer() {
 
       const selectedVoice = voiceName === 'Zephyr' ? 'Zephyr' : 'Kore';
 
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash-lite-tts',
+      const response = await runBalancedGeminiCall(
+        ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'],
+        (ai, model) =>
+          ai.models.generateContent({
+          model,
           contents: [
             {
               role: 'user',
@@ -832,10 +968,9 @@ async function startServer() {
     }
   });
 
-  // Speech-to-Text Transcription using gemini-3.5-transcribe
+  // Speech-to-Text Transcription (balanced across API key pool)
   app.post('/api/nova/transcribe', async (req, res) => {
     try {
-      const ai = getAiClient();
       const { audioBase64, mimeType = 'audio/webm' } = req.body as {
         audioBase64: string;
         mimeType?: string;
@@ -846,9 +981,9 @@ async function startServer() {
         return;
       }
 
-      const response = await withRetry(() =>
+      const response = await runBalancedGeminiCall(['gemini-3.5-transcribe'], (ai, model) =>
         ai.models.generateContent({
-          model: 'gemini-3.5-transcribe',
+          model,
           contents: {
             parts: [
               {
@@ -875,10 +1010,9 @@ async function startServer() {
     }
   });
 
-  // Fast Memory Extraction using gemini-3.1-flash-lite
+  // Fast Memory Extraction using balanced pool
   app.post('/api/nova/extract-memories', async (req, res) => {
     try {
-      const ai = getAiClient();
       const { userMessage, existingMemories = [] } = req.body as {
         userMessage: string;
         existingMemories?: Array<{ content: string }>;
@@ -891,40 +1025,34 @@ async function startServer() {
 
       const existingList = existingMemories.map((m) => `- ${m.content}`).join('\n');
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Analyze this user message and extract up to 2 genuinely useful, long-term personal facts (preferred name/nickname, hobbies, interests, learning goals, language preferences, or schedule habits).
-STRICT SAFETY RULES:
-- NEVER extract passwords, PINs, credit cards, bank info, addresses, phone numbers, or sensitive secrets.
-- Do NOT duplicate anything already listed in Existing Memories.
-- If nothing lasting or useful is present, return an empty array [].
-
-Existing Memories:
-${existingList || '(none)'}
-
-User Message:
-"${userMessage}"`,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                category: {
-                  type: Type.STRING,
-                  description: 'One of: preference, identity, interest, goal, language, note',
+      const response = await runBalancedGeminiCall(['gemini-3.1-flash-lite'], (ai, model) =>
+        ai.models.generateContent({
+          model,
+          contents: `Extract up to 2 safe personal facts (nickname, preference, hobby, goal, language). Never store passwords/financial/contact info or duplicates. Return [] if none.
+Existing: ${existingList || '(none)'}
+Message: "${userMessage}"`,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  category: {
+                    type: Type.STRING,
+                    description: 'One of: preference, identity, interest, goal, language, note',
+                  },
+                  content: {
+                    type: Type.STRING,
+                    description: 'Short factual memory under 140 chars',
+                  },
                 },
-                content: {
-                  type: Type.STRING,
-                  description: 'Short third-person or factual memory under 140 characters',
-                },
+                required: ['category', 'content'],
               },
-              required: ['category', 'content'],
             },
           },
-        },
-      });
+        })
+      );
 
       const raw = (response.text || '[]').trim();
       const parsed = JSON.parse(raw) as Array<{ category: string; content: string }>;
@@ -942,10 +1070,9 @@ User Message:
     }
   });
 
-  // Assistant Quick Tools & Automation Briefing
+  // Assistant Quick Tools & Automation Briefing (balanced across API key pool)
   app.post('/api/nova/assist', async (req, res) => {
     try {
-      const ai = getAiClient();
       const { task, input, targetLanguage, profile = {} } = req.body as {
         task: 'summarize' | 'translate' | 'study_plan' | 'draft_message' | 'briefing';
         input: string;
@@ -959,68 +1086,36 @@ User Message:
       };
 
       const safeProfile = profile || {};
-      let model = 'gemini-4-hydrogen';
       let prompt = input;
+      let modelOrder = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
 
       if (task === 'summarize') {
-        model = 'gemini-3.1-flash-lite';
-        prompt = `Summarize the following text clearly with key bullet takeaways in a warm, helpful tone:\n\n${input}`;
+        prompt = `Summarize concisely with bullet points:\n\n${input}`;
       } else if (task === 'translate') {
-        model = 'gemini-3.1-flash-lite';
-        prompt = `Translate the following text naturally into ${targetLanguage || 'English'}. Provide the translation clearly, plus a quick note on tone if helpful:\n\n${input}`;
+        prompt = `Translate naturally into ${targetLanguage || 'English'}:\n\n${input}`;
       } else if (task === 'study_plan') {
-        model = 'gemini-4-hydrogen';
-        prompt = `Create a clear, motivating, realistic step-by-step study plan for the user based on this goal:\n\n${input}`;
+        modelOrder = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+        prompt = `Create a concise, realistic step-by-step study plan for:\n\n${input}`;
       } else if (task === 'draft_message') {
-        model = 'gemini-4-hydrogen';
-        prompt = `Draft a clear, thoughtful message or email based on this request. Offer a warm natural version ready to copy or send:\n\n${input}`;
+        prompt = `Draft a clear, natural message ready to send:\n\n${input}`;
       } else if (task === 'briefing') {
-        model = 'gemini-4-hydrogen';
-        prompt = `Give ${safeProfile.preferredName || 'Muhib'} a warm, concise, encouraging daily briefing based on their real schedule and tasks below. Do not invent any tasks or events not listed:\n\n${input}`;
+        prompt = `Give ${safeProfile.preferredName || 'Muhib'} a short, loving briefing based only on these real events & tasks:\n\n${input}`;
       }
 
-      const assistConfig = {
-        systemInstruction: buildNovaSystemInstruction({
-          preferredName: safeProfile.preferredName,
-          preferredLanguage: safeProfile.preferredLanguage,
-          currentMood: safeProfile.currentMood,
-          currentMoodNote: safeProfile.currentMoodNote,
-        }),
-      };
+      const systemInstruction = buildNovaSystemInstruction({
+        preferredName: safeProfile.preferredName,
+        preferredLanguage: safeProfile.preferredLanguage,
+        currentMood: safeProfile.currentMood,
+        currentMoodNote: safeProfile.currentMoodNote,
+      });
 
-      const selectedAssistModel =
-        model === 'gemini-4-hydrogen' && Date.now() < hydrogenCooldownUntil
-          ? 'gemini-3.1-flash-lite'
-          : model;
-
-      let response;
-      try {
-        response = await withRetry(() =>
-          ai.models.generateContent({
-            model: selectedAssistModel,
-            contents: prompt,
-            config: assistConfig,
-          })
-        );
-      } catch (primaryErr) {
-        if (
-          selectedAssistModel === 'gemini-4-hydrogen' &&
-          extractUpstreamStatus(primaryErr) === 429
-        ) {
-          if (isDailyQuotaError(primaryErr)) {
-            hydrogenCooldownUntil = Date.now() + 5 * 60 * 1000;
-          }
-          response = await withRetry(() =>
-            ai.models.generateContent({
-              model: 'gemini-3.1-flash-lite',
-              contents: prompt,
-              config: assistConfig,
-            })
-          );
-        } else {
-          throw primaryErr;
-        }
-      }
+      const response = await runBalancedGeminiCall(modelOrder, (ai, model) =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: { systemInstruction },
+        })
+      );
 
       res.json({ text: response.text || '' });
     } catch (error) {
@@ -1057,7 +1152,6 @@ User Message:
       await verifyOwnerFirebaseToken(initPayload.idToken);
       isAuthenticated = true;
 
-      const ai = getAiClient();
       const selectedVoice = initPayload.voiceName === 'Zephyr' ? 'Zephyr' : 'Kore';
 
       const systemInstruction =
@@ -1072,10 +1166,11 @@ User Message:
           useSearch: false,
           workspaceConnected: false,
         }) +
-        '\n\nVoice Conversation Mode: Keep spoken replies concise, conversational, warm, and natural (2-4 sentences typically unless asked to explain in detail).';
+        '\n\nVoice Mode: Reply fast in 1-2 short, warm, loving sentences.';
 
-      liveSession = await ai.live.connect({
-        model: 'gemini-3.8-live',
+      liveSession = await runBalancedGeminiCall(['gemini-3.8-live'], (ai, model) =>
+        ai.live.connect({
+          model,
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
@@ -1147,7 +1242,8 @@ User Message:
             }
           },
         },
-      });
+      })
+      );
     };
 
     clientWs.on('message', async (raw) => {
@@ -1244,7 +1340,12 @@ User Message:
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`NOVA AI server listening on http://localhost:${PORT}`);
+    const pool = collectApiKeyPool();
+    console.log(
+      `NOVA AI server listening on http://localhost:${PORT} (${pool.length} API key${
+        pool.length === 1 ? '' : 's'
+      } in balanced pool)`
+    );
   });
 }
 

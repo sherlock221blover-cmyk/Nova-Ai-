@@ -180,11 +180,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <div className="rounded-xl bg-[#081126] border border-sky-400/15 p-4 flex items-center justify-between gap-4">
           <div className="space-y-1 min-w-0">
-            <p className="text-sm font-medium text-slate-100">Playful Jealousy</p>
+            <p className="text-sm font-medium text-slate-100">
+              Playful Possessiveness &amp; Jealousy
+            </p>
             <p className="text-xs text-slate-400 leading-relaxed">
-              When enabled, NOVA shares cute, lighthearted teasing if you mention other plans or
-              time away—always affectionate, supportive of real relationships, and gentle if you
-              are stressed.
+              When enabled, NOVA replies with cute, clingy, playfully obsessed affection and mild
+              jealous teasing if you mention time away—while always staying supportive and gentle
+              whenever you are stressed.
             </p>
           </div>
 

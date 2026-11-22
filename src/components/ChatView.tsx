@@ -347,35 +347,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
         ? data.pendingActions
         : [];
 
-      // Optional fast background memory suggestion only when message appears to share a personal detail
-      const looksPersonal =
-        trimmed.length >= 24 &&
-        /\b(my |i am |i'm |i like|i love|call me|prefer|hobby|goal|study|working on|favorite)\b/i.test(
-          trimmed
-        );
-      if (uid && (profile?.autoMemoryExtract ?? true) && nextPending.length === 0 && looksPersonal) {
-        novaFetch('/api/nova/extract-memories', {
-          userMessage: trimmed,
-          existingMemories: memories.map((m) => ({ content: m.content })),
-        })
-          .then((r) => r.json())
-          .then((memData) => {
-            if (Array.isArray(memData.suggestions) && memData.suggestions.length > 0) {
-              const memActions: PendingAction[] = memData.suggestions.map(
-                (s: { category: string; content: string }, i: number) => ({
-                  id: `mem_suggest_${Date.now()}_${i}`,
-                  type: 'save_memory',
-                  title: 'Save to Long-Term Memory',
-                  summary: `[${s.category}] ${s.content}`,
-                  payload: { category: s.category, content: s.content },
-                })
-              );
-              setPendingActions((prev) => [...prev, ...memActions]);
-            }
-          })
-          .catch(() => {});
-      }
-
       if (nextPending.length > 0) {
         setPendingActions((prev) => [...prev, ...nextPending]);
       }
