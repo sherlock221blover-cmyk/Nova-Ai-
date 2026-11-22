@@ -222,7 +222,26 @@ export const initAuth = (
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
   try {
     isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
+    let result;
+    try {
+      result = await signInWithPopup(auth, provider);
+    } catch (popupErr: unknown) {
+      const errCode = (popupErr as { code?: string })?.code || '';
+      const errMsg = (popupErr as { message?: string })?.message || '';
+      if (
+        errCode === 'auth/unauthorized-domain' ||
+        errCode === 'auth/popup-blocked' ||
+        errCode === 'auth/popup-closed-by-user' ||
+        errMsg.includes('unauthorized domain') ||
+        errMsg.includes('popup')
+      ) {
+        // Fallback to redirect flow which works across all custom or preview domains
+        await import('firebase/auth').then((m) => m.signInWithRedirect(auth, provider));
+        return null;
+      }
+      throw popupErr;
+    }
+
     if (!isAuthorizedOwnerUser(result.user)) {
       cachedAccessToken = null;
       await auth.signOut().catch(() => {});
